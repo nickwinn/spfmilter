@@ -8,6 +8,7 @@
 # This code is under GPL.  See COPYING for details.
 
 import sys
+import os
 import Milter
 import spf
 import syslog
@@ -24,10 +25,13 @@ class Config(object):
     self.trusted_relay = ()
     self.trusted_forwarder = ()
     self.access_file = None
+    #os.umask(config.savumask)
 
 def read_config(list):
   "Return new config object."
-  cp = MilterConfigParser()
+  cp = MilterConfigParser({
+    'access_file_nulls': 'no'
+  })
   cp.read(list)
   if cp.has_option('milter','datadir'):
         os.chdir(cp.get('milter','datadir'))
@@ -38,21 +42,35 @@ def read_config(list):
   conf.internal_connect = cp.getlist('milter','internal_connect')
   conf.untrapped_exception = cp.getdefault('milter','untrapped_exception',
         'CONTINUE')
+  conf.umask = int(cp.getdefault('milter','umask',default='0177'),base=0)
+  # SPF options
   if cp.has_option('spf','trusted_forwarder'):
     conf.trusted_forwarder = cp.getlist('spf','trusted_forwarder')
   else: # backward compatibility with config typo
     conf.trusted_forwarder = cp.getlist('spf','trusted_relay')
   conf.access_file = cp.getdefault('spf','access_file',None)
+  conf.access_file_nulls = cp.getboolean('spf','access_file_nulls')
   return conf
 
 class SPFPolicy(object):
   "Get SPF policy by result from sendmail style access file."
-  def __init__(self,sender,access_file=None):
+  def __init__(self,sender,conf=None,access_file=None):
+    if conf:
+      conf = config
+    if not access_file:
+      access_file = conf.access_file
+    if conf: 
+      self.use_nulls = conf.access_file_nulls
+    else:
+      self.use_nulls = False
     self.sender = sender
     self.domain = sender.split('@')[-1].lower()
     if access_file:
-      try: acf = anydbm.open(access_file,'r')
-      except: acf = None
+      try:
+        acf = anydbm.open(access_file,'r')
+      except:
+	syslog.syslog('%s: Cannot open for reading'%access_file)
+	acf = None
     else: acf = None
     self.acf = acf
 
@@ -63,23 +81,23 @@ class SPFPolicy(object):
   def __exit__(self,t,v,b): self.close()
 
   def getPolicy(self,pfx):
-    pol = self._getPolicy(pfx)
-    syslog.syslog('%s %s'%(pfx,pol))
-    return pol
-
-  def _getPolicy(self,pfx):
     acf = self.acf
     if not acf: return None
+    if self.use_nulls: sfx = '\x00'
+    else: sfx = ''
     try:
-      return acf[pfx + self.sender + '\x00'].rstrip('\x00')
+      return acf[pfx + self.sender + sfx].rstrip('\x00')
     except KeyError:
       try:
-        return acf[pfx + self.domain + '\x00'].rstrip('\x00')
+        return acf[pfx + self.domain + sfx].rstrip('\x00')
       except KeyError:
         try:
-          return acf[pfx + '\x00'].rstrip('\x00')
+          return acf[pfx + sfx].rstrip('\x00')
         except KeyError:
-          return None
+	  try:
+	    return acf[pfx.rstrip(':') + sfx].rstrip('\x00')
+	  except KeyError:
+	    return None
   
 class spfMilter(Milter.Base):
   "Milter to check SPF.  Each connection gets its own instance."
@@ -132,7 +150,7 @@ class spfMilter(Milter.Base):
       if ip4re.match(hostname):
         self.log("REJECT: numeric hello name:",hostname)
         self.setreply('550','5.7.1','hello name cannot be numeric ip')
-        return Milter.CONTINUE
+        return Milter.REJECT
     return Milter.CONTINUE
 
   # multiple messages can be received on a single connection
@@ -144,7 +162,7 @@ class spfMilter(Milter.Base):
     if not self.hello_name:
       self.log('REJECT: missing HELO')
       self.setreply('550','5.7.1',"It's polite to say helo first.")
-      return Milter.CONTINUE
+      return Milter.REJECT
     self.mailfrom = f
     t = parse_addr(f)
     if len(t) == 2:
@@ -176,7 +194,7 @@ class spfMilter(Milter.Base):
       )
       # Restrict SMTP AUTH users to authorized domains
       authsend = '@'.join((self.user,domain))
-      with SPFPolicy(authsend,access_file=self.conf.access_file) as p:
+      with SPFPolicy(authsend,self.conf) as p:
         policy = p.getPolicy('smtp-auth:')
       if policy:
         if policy != 'OK':
@@ -186,7 +204,7 @@ class spfMilter(Milter.Base):
             'SMTP user %s is not authorized to send from domain %s.' %
             (self.user,domain)
           )
-          return Milter.CONTINUE
+          return Milter.REJECT
       self.log("SMTP authorized user",self.user,"sending from domain",domain)
 
     if not (self.internal_connection or self.trusted_relay) and self.connectip:
@@ -213,14 +231,14 @@ class spfMilter(Milter.Base):
       q = spf.query(self.connectip,self.canon_from,self.hello_name,
 	  receiver=receiver,strict=False)
       q.set_default_explanation(
-	'SPF fail: see http://openspf.net/why.html?sender=%s&ip=%s' % (q.s,q.i))
+	'SPF fail: see http://openspf.org/why.html?sender=%s&ip=%s' % (q.s,q.i))
       res,code,txt = q.check()
     if res not in ('pass','temperror'):
       if self.mailfrom != '<>':
 	# check hello name via spf unless spf pass
         h = spf.query(self.connectip,'',self.hello_name,receiver=receiver)
         hres,hcode,htxt = h.check()
-        with SPFPolicy(self.hello_name,self.conf.access_file) as hp:
+        with SPFPolicy(self.hello_name,self.conf) as hp:
           policy = hp.getPolicy('helo-%s:'%hres)
           #print 'helo-%s:%s %s'%(hres,self.hello_name,policy)
           if not policy:
@@ -236,12 +254,12 @@ class spfMilter(Milter.Base):
             "get this bounce, the message was not in fact a forgery, and you",
             "should IMMEDIATELY notify your email administrator of the problem."
           )
-          return Milter.CONTINUE
+          return Milter.REJECT
       else:
         hres,hcode,htxt = res,code,txt
     else: hres = None
 
-    with SPFPolicy(q.s,self.conf.access_file) as p:
+    with SPFPolicy(q.s,self.conf) as p:
       if res == 'fail':
         policy = p.getPolicy('spf-fail:')
         if not policy or policy == 'REJECT':
@@ -250,7 +268,7 @@ class spfMilter(Milter.Base):
           # A proper SPF fail error message would read:
           # forger.biz [1.2.3.4] is not allowed to send mail with the domain
           # "forged.org" in the sender address.  Contact <postmaster@forged.org>.
-          return Milter.CONTINUE
+          return Milter.REJECT
       elif res == 'softfail':
         policy = p.getPolicy('spf-softfail:')
         if policy and policy == 'REJECT':
@@ -259,7 +277,7 @@ class spfMilter(Milter.Base):
           # A proper SPF fail error message would read:
           # forger.biz [1.2.3.4] is not allowed to send mail with the domain
           # "forged.org" in the sender address.  Contact <postmaster@forged.org>.
-          return Milter.CONTINUE
+          return Milter.REJECT
       elif res == 'permerror':
         policy = p.getPolicy('spf-permerror:')
         if not policy or policy == 'REJECT':
@@ -269,28 +287,28 @@ class spfMilter(Milter.Base):
             'There is a fatal syntax error in the SPF record for %s' % q.o,
             'We cannot accept mail from %s until this is corrected.' % q.o
           )
-          return Milter.CONTINUE
+          return Milter.REJECT
       elif res == 'temperror':
         policy = p.getPolicy('spf-temperror:')
         if not policy or policy == 'REJECT':
           self.log('TEMPFAIL: SPF %s %i %s' % (res,code,txt))
           self.setreply(str(code),'4.3.0',txt)
-          return Milter.CONTINUE
+          return Milter.TEMPFAIL
       elif res == 'neutral' or res == 'none':
         policy = p.getPolicy('spf-neutral:')
         if policy and policy == 'REJECT':
           self.log('REJECT NEUTRAL:',q.s)
           self.setreply('550','5.7.1',
-    "%s requires an SPF PASS to accept mail from %s. [http://openspf.net]"
+    "%s requires an SPF PASS to accept mail from %s. [http://openspf.org]"
             % (receiver,q.s))
-          return Milter.CONTINUE
+          return Milter.REJECT
       elif res == 'pass':
         policy = p.getPolicy('spf-pass:')
         if policy and policy == 'REJECT':
           self.log('REJECT PASS:',q.s)
           self.setreply('550','5.7.1',
                   "%s has been blacklisted by %s." % (q.s,receiver))
-          return Milter.CONTINUE
+          return Milter.REJECT
     self.add_header('Received-SPF',q.get_header(res,receiver),0)
     if hres and q.h != q.o:
       self.add_header('X-Hello-SPF',hres,0)
@@ -300,26 +318,30 @@ if __name__ == "__main__":
   Milter.factory = spfMilter
   Milter.set_flags(Milter.CHGHDRS + Milter.ADDHDRS)
   global config
-  config = read_config(['spfmilter.cfg','/usr/lib/pymilter/spfmilter.cfg'])
+  config = read_config(
+    ['spfmilter.cfg','/etc/mail/spfmilter.cfg','/etc/postfix/spfmilter.cfg'])
   ue = config.untrapped_exception.upper()
   if ue == 'CONTINUE':
     Milter.set_exception_policy(Milter.CONTINUE)
   elif ue == 'REJECT':
-    Milter.set_exception_policy(Milter.CONTINUE)
+    Milter.set_exception_policy(Milter.REJECT)
   elif ue == 'TEMPFAIL':
-    Milter.set_exception_policy(Milter.CONTINUE)
+    Milter.set_exception_policy(Milter.TEMPFAIL)
   else:
     print("WARNING: invalid untrapped_exception policy: %s"%ue)
 
   miltername = config.miltername
   socketname = config.socketname
-#  print("""To use this with sendmail, add the following to sendmail.cf:
-#
-#O InputMailFilters=%s
-#X%s,        S=local:%s
-#
-#See the sendmail README for libmilter.
-#spfmilter startup""" % (miltername,miltername,socketname))
+  # FIXME: set process umask based on config
+  print("""To use this with sendmail, add the following to sendmail.cf:
+
+O InputMailFilters=%s
+X%s,        S=local:%s
+
+See the sendmail README for libmilter.
+spfmilter startup""" % (miltername,miltername,socketname))
   sys.stdout.flush()
-  Milter.runmilter(miltername,'inet:8892',240)
+  config.savumask = os.umask(config.umask)
+  Milter.runmilter(miltername,socketname,240)
   print "spfmilter shutdown"
+
